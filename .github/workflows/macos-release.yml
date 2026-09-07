@@ -158,7 +158,8 @@ jobs:
           ZIP="dist-release/${BASENAME}-${VERSION}-macOS.zip"
           # ditto preserves the xattrs holding the stapled ticket; zip does not.
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP"
-          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
+          # Record the bare filename so `shasum -c` works where users unpack it.
+          (cd dist-release && shasum -a 256 "$(basename "$ZIP")" | tee "$(basename "$ZIP").sha256")
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
@@ -204,8 +205,12 @@ jobs:
 
       - name: 🔐 Checksum dmg
         if: inputs.make-dmg
-        run: shasum -a 256 "${{ steps.dmg.outputs.dmg }}" \
-               | tee "${{ steps.dmg.outputs.dmg }}.sha256"
+        env:
+          DMG: ${{ steps.dmg.outputs.dmg }}
+        run: |
+          set -euo pipefail
+          (cd dist-release && shasum -a 256 "$(basename "$DMG")" \
+             | tee "$(basename "$DMG").sha256")
 
       - name: 📤 Upload build artifacts
         uses: actions/upload-artifact@v4
