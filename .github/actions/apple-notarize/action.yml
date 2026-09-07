@@ -65,6 +65,22 @@ runs:
           fi
         fi
 
+        # Cheap round-trip that fails fast and unambiguously on bad credentials,
+        # instead of surfacing them as a confusing submit failure.
+        if ! xcrun notarytool history \
+             --key "$KEY_PATH" \
+             --key-id "$API_KEY_ID" \
+             --issuer "$API_ISSUER_ID" \
+             --output-format json >/dev/null 2>"$RUNNER_TEMP/notary-auth-error"; then
+          echo "::error::Notary credentials rejected by Apple:"
+          sed 's/^/::error::  /' "$RUNNER_TEMP/notary-auth-error" || true
+          echo "::error::Verify APPLE_NOTARY_KEY_ID, APPLE_NOTARY_ISSUER_ID and"
+          echo "::error::APPLE_NOTARY_KEY_P8_BASE64 — all three must come from the"
+          echo "::error::same App Store Connect key, and the key needs the"
+          echo "::error::Developer role under Team Keys (not Individual Keys)."
+          exit 1
+        fi
+
         echo "📤 Submitting $(basename "$SUBMIT") to the notary service..."
         SUBMIT_OUTPUT="$RUNNER_TEMP/notary-submit.json"
         set +e
@@ -79,11 +95,30 @@ runs:
         set -e
 
         cat "$SUBMIT_OUTPUT"
-        SUBMISSION_ID=$(/usr/bin/plutil -extract id raw -o - "$SUBMIT_OUTPUT" 2>/dev/null || echo "")
-        VERDICT=$(/usr/bin/plutil -extract status raw -o - "$SUBMIT_OUTPUT" 2>/dev/null || echo "")
+
+        # Auth failures make notarytool exit before writing any JSON, so parse
+        # only when there is something to parse — otherwise plutil's own error
+        # text gets mistaken for a submission id.
+        SUBMISSION_ID=""
+        VERDICT=""
+        if [ -s "$SUBMIT_OUTPUT" ]; then
+          SUBMISSION_ID=$(/usr/bin/plutil -extract id raw -o - "$SUBMIT_OUTPUT" 2>/dev/null || true)
+          VERDICT=$(/usr/bin/plutil -extract status raw -o - "$SUBMIT_OUTPUT" 2>/dev/null || true)
+          case "$SUBMISSION_ID" in
+            *[!0-9A-Fa-f-]* | "") SUBMISSION_ID="" ;;
+          esac
+        fi
 
         if [ "$SUBMIT_STATUS" -ne 0 ] || [ "$VERDICT" != "Accepted" ]; then
-          echo "::error::Notarization failed (status=${VERDICT:-unknown})"
+          if [ -z "$VERDICT" ]; then
+            echo "::error::notarytool could not reach a verdict — this is almost"
+            echo "::error::always bad credentials. Check APPLE_NOTARY_KEY_ID,"
+            echo "::error::APPLE_NOTARY_ISSUER_ID and APPLE_NOTARY_KEY_P8_BASE64."
+            echo "::error::A 401 means the key, issuer and .p8 do not belong together."
+          else
+            echo "::error::Notarization rejected (status=$VERDICT)"
+          fi
+
           if [ -n "$SUBMISSION_ID" ]; then
             echo "--- notary log for $SUBMISSION_ID ---"
             xcrun notarytool log "$SUBMISSION_ID" \
