@@ -1,0 +1,106 @@
+name: Import Apple signing certificates
+description: >
+  Imports Developer ID certificates into a throwaway keychain and verifies that
+  every requested identity is visible to codesign. The Application certificate
+  is required; the Installer certificate is optional and only needed for .pkg
+  signing. The keychain lives in RUNNER_TEMP and should be deleted by the
+  caller's cleanup step.
+
+inputs:
+  application-p12-base64:
+    description: Base64-encoded "Developer ID Application" .p12
+    required: true
+  application-p12-password:
+    description: Password used when the Application .p12 was exported
+    required: true
+  application-identity:
+    description: 'Full identity, e.g. "Developer ID Application: Name (TEAMID)"'
+    required: true
+  installer-p12-base64:
+    description: Base64-encoded "Developer ID Installer" .p12 (optional, for .pkg)
+    required: false
+    default: ""
+  installer-p12-password:
+    description: Password used when the Installer .p12 was exported
+    required: false
+    default: ""
+  installer-identity:
+    description: 'Full identity, e.g. "Developer ID Installer: Name (TEAMID)"'
+    required: false
+    default: ""
+
+outputs:
+  keychain-path:
+    description: Path to the temporary keychain, for the caller's cleanup step
+    value: ${{ steps.import.outputs.keychain-path }}
+
+runs:
+  using: composite
+  steps:
+    - id: import
+      shell: bash
+      env:
+        APPLICATION_P12_BASE64: ${{ inputs.application-p12-base64 }}
+        APPLICATION_P12_PASSWORD: ${{ inputs.application-p12-password }}
+        APPLICATION_IDENTITY: ${{ inputs.application-identity }}
+        INSTALLER_P12_BASE64: ${{ inputs.installer-p12-base64 }}
+        INSTALLER_P12_PASSWORD: ${{ inputs.installer-p12-password }}
+        INSTALLER_IDENTITY: ${{ inputs.installer-identity }}
+      run: |
+        set -euo pipefail
+
+        KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+        # Ephemeral: this keychain lives and dies with the job, so a random
+        # password beats one stored as a secret and synced across repos.
+        KEYCHAIN_PASSWORD="$(uuidgen)"
+
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+        import_p12() {
+          local b64="$1" password="$2" label="$3"
+          local cert_path="$RUNNER_TEMP/${label}.p12"
+          echo -n "$b64" | base64 --decode -o "$cert_path"
+          security import "$cert_path" \
+            -P "$password" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          rm -f "$cert_path"
+        }
+
+        import_p12 "$APPLICATION_P12_BASE64" "$APPLICATION_P12_PASSWORD" application
+
+        if [ -n "$INSTALLER_P12_BASE64" ]; then
+          import_p12 "$INSTALLER_P12_BASE64" "$INSTALLER_P12_PASSWORD" installer
+        fi
+
+        security set-key-partition-list \
+          -S apple-tool:,apple:,codesign:,productbuild: \
+          -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+
+        # Make the temp keychain searchable alongside the default ones.
+        security list-keychain -d user -s "$KEYCHAIN_PATH" \
+          $(security list-keychains -d user | tr -d '"')
+
+        # `find-identity -p codesigning` does not list Installer certs, so each
+        # kind has to be checked against the policy that actually applies.
+        require_identity() {
+          local identity="$1" policy="$2" kind="$3"
+          if ! security find-identity -v -p "$policy" "$KEYCHAIN_PATH" \
+               | grep -qF "$identity"; then
+            echo "::error::$kind identity not found in keychain: $identity"
+            echo "Identities available for policy '$policy':"
+            security find-identity -v -p "$policy" "$KEYCHAIN_PATH"
+            exit 1
+          fi
+          echo "✅ $kind identity ready: $identity"
+        }
+
+        require_identity "$APPLICATION_IDENTITY" codesigning Application
+
+        if [ -n "$INSTALLER_IDENTITY" ]; then
+          require_identity "$INSTALLER_IDENTITY" macappstore Installer
+        fi
+
+        echo "keychain-path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"

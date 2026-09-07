@@ -1,0 +1,105 @@
+name: Notarize and staple
+description: >
+  Submits one artifact (.zip of a .app, or a .dmg) to Apple's notary service,
+  waits for the verdict, then staples the ticket onto the target. On rejection
+  it fetches the full notary log, which is the only place Apple explains why.
+
+inputs:
+  path:
+    description: Item to staple — a .app bundle or a .dmg
+    required: true
+  submit-path:
+    description: >
+      Item to upload. For a .app pass a zip of it; for a .dmg pass the dmg
+      itself. Defaults to `path`.
+    required: false
+    default: ""
+  api-key-id:
+    required: true
+    description: App Store Connect API key id
+  api-issuer-id:
+    required: true
+    description: App Store Connect issuer id
+  api-key-base64:
+    required: true
+    description: Base64-encoded .p8 private key
+  timeout:
+    required: false
+    default: 30m
+    description: How long to wait for the notary verdict
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TARGET_PATH: ${{ inputs.path }}
+        SUBMIT_PATH: ${{ inputs.submit-path }}
+        API_KEY_ID: ${{ inputs.api-key-id }}
+        API_ISSUER_ID: ${{ inputs.api-issuer-id }}
+        API_KEY_BASE64: ${{ inputs.api-key-base64 }}
+        NOTARY_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+
+        KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+        CLEANUP_ZIP=""
+        cleanup() {
+          rm -f "$KEY_PATH"
+          [ -n "$CLEANUP_ZIP" ] && rm -f "$CLEANUP_ZIP"
+          return 0
+        }
+        trap cleanup EXIT
+
+        echo -n "$API_KEY_BASE64" | base64 --decode -o "$KEY_PATH"
+
+        SUBMIT="$SUBMIT_PATH"
+        if [ -z "$SUBMIT" ]; then
+          if [ -d "$TARGET_PATH" ]; then
+            # notarytool only accepts zip/dmg/pkg, never a bare bundle.
+            SUBMIT="$RUNNER_TEMP/notarize-$(basename "$TARGET_PATH").zip"
+            ditto -c -k --keepParent "$TARGET_PATH" "$SUBMIT"
+            CLEANUP_ZIP="$SUBMIT"
+          else
+            SUBMIT="$TARGET_PATH"
+          fi
+        fi
+
+        echo "📤 Submitting $(basename "$SUBMIT") to the notary service..."
+        SUBMIT_OUTPUT="$RUNNER_TEMP/notary-submit.json"
+        set +e
+        xcrun notarytool submit "$SUBMIT" \
+          --key "$KEY_PATH" \
+          --key-id "$API_KEY_ID" \
+          --issuer "$API_ISSUER_ID" \
+          --wait \
+          --timeout "$NOTARY_TIMEOUT" \
+          --output-format json > "$SUBMIT_OUTPUT"
+        SUBMIT_STATUS=$?
+        set -e
+
+        cat "$SUBMIT_OUTPUT"
+        SUBMISSION_ID=$(/usr/bin/plutil -extract id raw -o - "$SUBMIT_OUTPUT" 2>/dev/null || echo "")
+        VERDICT=$(/usr/bin/plutil -extract status raw -o - "$SUBMIT_OUTPUT" 2>/dev/null || echo "")
+
+        if [ "$SUBMIT_STATUS" -ne 0 ] || [ "$VERDICT" != "Accepted" ]; then
+          echo "::error::Notarization failed (status=${VERDICT:-unknown})"
+          if [ -n "$SUBMISSION_ID" ]; then
+            echo "--- notary log for $SUBMISSION_ID ---"
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$KEY_PATH" \
+              --key-id "$API_KEY_ID" \
+              --issuer "$API_ISSUER_ID" || true
+          fi
+          exit 1
+        fi
+
+        echo "📎 Stapling ticket onto $(basename "$TARGET_PATH")..."
+        xcrun stapler staple "$TARGET_PATH"
+        xcrun stapler validate "$TARGET_PATH"
+
+        if [ -d "$TARGET_PATH" ]; then
+          spctl --assess --type execute --verbose=2 "$TARGET_PATH"
+        fi
+
+        echo "✅ Notarized and stapled: $TARGET_PATH"

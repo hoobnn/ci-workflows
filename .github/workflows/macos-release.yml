@@ -1,0 +1,241 @@
+name: macOS build, sign, notarize and release
+
+on:
+  workflow_call:
+    inputs:
+      app-path:
+        description: 'Path to the built .app, e.g. "dist/My App.app"'
+        required: true
+        type: string
+      build-command:
+        description: Shell command that produces the .app
+        required: true
+        type: string
+      artifact-basename:
+        description: Base name for release files, e.g. "Keyboard-Logo-Fix"
+        required: true
+        type: string
+      inner-binaries:
+        description: >
+          Newline-separated paths (relative to the .app) of nested binaries that
+          must be signed before the outer bundle. Leave empty for a single-binary app.
+        required: false
+        type: string
+        default: ""
+      entitlements:
+        description: Path to an .entitlements file for the outer app (optional)
+        required: false
+        type: string
+        default: ""
+      make-dmg:
+        description: Also build, sign and notarize a .dmg
+        required: false
+        type: boolean
+        default: false
+      dmg-volume-name:
+        description: Volume name for the .dmg (defaults to artifact-basename)
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        description: Runner image — pin it, `macos-latest` moves under you
+        required: false
+        type: string
+        default: macos-15
+      release-notes-file:
+        description: Optional file whose contents become the release body
+        required: false
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: Version taken from the app's CFBundleShortVersionString
+        value: ${{ jobs.release.outputs.version }}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runs-on }}
+    # Forks cannot read secrets; skip rather than fail with a confusing error.
+    if: github.event.repository.fork == false
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔑 Import signing certificates
+        id: signing
+        uses: hoobnn/ci-workflows/.github/actions/apple-signing@v1
+        with:
+          application-p12-base64: ${{ secrets.APPLE_CERT_APPLICATION_P12_BASE64 }}
+          application-p12-password: ${{ secrets.APPLE_CERT_APPLICATION_P12_PASSWORD }}
+          application-identity: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
+          installer-p12-base64: ${{ secrets.APPLE_CERT_INSTALLER_P12_BASE64 }}
+          installer-p12-password: ${{ secrets.APPLE_CERT_INSTALLER_P12_PASSWORD }}
+          installer-identity: ${{ vars.APPLE_SIGN_IDENTITY_INSTALLER }}
+
+      - name: 🔨 Build
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          # Build scripts may sign inline; hand them the real identity so a
+          # local ad-hoc default does not silently win.
+          APPLE_SIGN_IDENTITY_APPLICATION: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
+        run: ${{ inputs.build-command }}
+
+      - name: ✍️ Code-sign with Developer ID
+        env:
+          APP_PATH: ${{ inputs.app-path }}
+          INNER_BINARIES: ${{ inputs.inner-binaries }}
+          ENTITLEMENTS: ${{ inputs.entitlements }}
+          SIGN_IDENTITY: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
+        run: |
+          set -euo pipefail
+
+          test -d "$APP_PATH" || { echo "::error::App not found: $APP_PATH"; exit 1; }
+
+          # Strip quarantine/extended attrs that would break the seal.
+          xattr -cr "$APP_PATH"
+
+          # Inner-most first. `--deep` is deprecated and signs nested code with
+          # the outer bundle's flags, which is wrong for helper binaries.
+          if [ -n "$INNER_BINARIES" ]; then
+            while IFS= read -r rel; do
+              [ -z "$rel" ] && continue
+              target="$APP_PATH/$rel"
+              test -e "$target" || { echo "::error::Inner binary missing: $target"; exit 1; }
+              echo "✍️  Signing inner: $rel"
+              codesign --force --timestamp --options runtime \
+                --sign "$SIGN_IDENTITY" "$target"
+            done <<< "$INNER_BINARIES"
+          fi
+
+          SIGN_ARGS=(--force --timestamp --options runtime --sign "$SIGN_IDENTITY")
+          if [ -n "$ENTITLEMENTS" ]; then
+            test -f "$ENTITLEMENTS" || { echo "::error::Entitlements not found: $ENTITLEMENTS"; exit 1; }
+            SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+          fi
+
+          echo "✍️  Signing bundle: $APP_PATH"
+          codesign "${SIGN_ARGS[@]}" "$APP_PATH"
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          codesign --display --verbose=4 "$APP_PATH" 2>&1 | grep -E "Authority|TeamIdentifier|flags"
+
+      - name: 📜 Notarize and staple the app
+        uses: hoobnn/ci-workflows/.github/actions/apple-notarize@v1
+        with:
+          path: ${{ inputs.app-path }}
+          api-key-id: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          api-issuer-id: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          api-key-base64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+
+      - name: 📦 Package zip
+        id: package
+        env:
+          APP_PATH: ${{ inputs.app-path }}
+          BASENAME: ${{ inputs.artifact-basename }}
+        run: |
+          set -euo pipefail
+
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+            "$APP_PATH/Contents/Info.plist")
+
+          # A tag must agree with the bundle, or users get a version that does
+          # not match what they downloaded.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            if [ "$TAG_VERSION" != "$VERSION" ]; then
+              echo "::error::Tag v$TAG_VERSION does not match CFBundleShortVersionString $VERSION"
+              exit 1
+            fi
+          fi
+
+          mkdir -p dist-release
+          ZIP="dist-release/${BASENAME}-${VERSION}-macOS.zip"
+          # ditto preserves the xattrs holding the stapled ticket; zip does not.
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP"
+          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: 💿 Build and sign dmg
+        id: dmg
+        if: inputs.make-dmg
+        env:
+          APP_PATH: ${{ inputs.app-path }}
+          BASENAME: ${{ inputs.artifact-basename }}
+          VERSION: ${{ steps.package.outputs.version }}
+          VOLUME_NAME: ${{ inputs.dmg-volume-name || inputs.artifact-basename }}
+          SIGN_IDENTITY: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
+        run: |
+          set -euo pipefail
+
+          STAGE="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp -R "$APP_PATH" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+
+          DMG="dist-release/${BASENAME}-${VERSION}-macOS.dmg"
+          hdiutil create -volname "$VOLUME_NAME" \
+            -srcfolder "$STAGE" \
+            -ov -format UDZO \
+            -imagekey zlib-level=9 \
+            "$DMG"
+
+          # The container is a separate artifact: it needs its own signature,
+          # notarization and staple even though the app inside already has all three.
+          codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: 📜 Notarize and staple the dmg
+        if: inputs.make-dmg
+        uses: hoobnn/ci-workflows/.github/actions/apple-notarize@v1
+        with:
+          path: ${{ steps.dmg.outputs.dmg }}
+          api-key-id: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          api-issuer-id: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          api-key-base64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+
+      - name: 🔐 Checksum dmg
+        if: inputs.make-dmg
+        run: shasum -a 256 "${{ steps.dmg.outputs.dmg }}" \
+               | tee "${{ steps.dmg.outputs.dmg }}.sha256"
+
+      - name: 📤 Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-basename }}-${{ steps.package.outputs.version }}
+          path: dist-release/*
+          retention-days: 30
+
+      - name: 🚀 Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES_FILE: ${{ inputs.release-notes-file }}
+        run: |
+          set -euo pipefail
+
+          NOTES_ARGS=(--generate-notes)
+          if [ -n "$NOTES_FILE" ] && [ -f "$NOTES_FILE" ]; then
+            NOTES_ARGS=(--notes-file "$NOTES_FILE")
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist-release/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist-release/* \
+              --title "$GITHUB_REF_NAME" \
+              "${NOTES_ARGS[@]}"
+          fi
+
+      - name: 🧹 Delete signing keychain
+        if: always()
+        run: |
+          security delete-keychain "${{ steps.signing.outputs.keychain-path }}" 2>/dev/null || true
