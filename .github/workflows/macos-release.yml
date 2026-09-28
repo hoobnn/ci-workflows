@@ -58,6 +58,8 @@ permissions:
 jobs:
   release:
     runs-on: ${{ inputs.runs-on }}
+    # Notarization usually takes minutes; an hour means Apple's queue is stuck.
+    timeout-minutes: 60
     # Forks cannot read secrets; skip rather than fail with a confusing error.
     if: github.event.repository.fork == false
     outputs:

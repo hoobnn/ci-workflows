@@ -1,0 +1,121 @@
+name: Sync Homebrew cask
+
+# Points a cask in the tap at a freshly published GitHub Release: rewrites its
+# `version` and `sha256` from the release's own `.sha256` file and pushes.
+#
+# Call it after macos-release.yml, on tags only:
+#
+#   homebrew:
+#     needs: release
+#     if: startsWith(github.ref, 'refs/tags/v')
+#     uses: hoobnn/ci-workflows/.github/workflows/homebrew-cask.yml@v1
+#     with:
+#       cask: my-app
+#       artifact-basename: My-App
+#       version: ${{ needs.release.outputs.version }}
+#     secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      cask:
+        description: Cask token, i.e. the file name under Casks/ without .rb
+        required: true
+        type: string
+      artifact-basename:
+        description: Same value given to macos-release.yml
+        required: true
+        type: string
+      version:
+        description: Released version, normally needs.release.outputs.version
+        required: true
+        type: string
+      tap:
+        description: Tap repository as owner/name
+        required: false
+        type: string
+        default: hoobnn/homebrew-tap
+    secrets:
+      # Required: a release whose cask keeps the previous sha256 installs
+      # nowhere, so a missing token must fail the run, not skip quietly.
+      HOMEBREW_TAP_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Update ${{ inputs.cask }}
+    # Linux on purpose: GNU sed below, and a fraction of a macOS minute.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Fetch released dmg checksum
+        id: checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILE: ${{ inputs.artifact-basename }}-${{ inputs.version }}-macOS.dmg.sha256
+        run: |
+          set -euo pipefail
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            --pattern "$FILE" --dir "$RUNNER_TEMP"
+          SHA=$(awk '{print $1}' "$RUNNER_TEMP/$FILE")
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Bad checksum in $FILE: '$SHA'"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 🍺 Update cask and push
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP: ${{ inputs.tap }}
+          CASK: ${{ inputs.cask }}
+          VERSION: ${{ inputs.version }}
+          DMG_SHA: ${{ steps.checksum.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is empty; cannot sync the cask."
+            exit 1
+          fi
+
+          TAP_DIR="$RUNNER_TEMP/tap"
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${TAP}.git" "$TAP_DIR"
+          cd "$TAP_DIR"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          FILE="Casks/${CASK}.rb"
+          test -f "$FILE" || { echo "::error::$FILE not found in $TAP"; exit 1; }
+
+          rewrite() {
+            sed -i -E \
+              -e "s/^(  version \")[^\"]+(\")/\1${VERSION}\2/" \
+              -e "s/^(  sha256 \")[^\"]+(\")/\1${DMG_SHA}\2/" \
+              "$FILE"
+            if ! grep -q "^  version \"${VERSION}\"$" "$FILE" \
+              || ! grep -q "^  sha256 \"${DMG_SHA}\"$" "$FILE"; then
+              echo "::error::$FILE has no version/sha256 line in the expected form"
+              exit 1
+            fi
+          }
+
+          rewrite
+          if git diff --quiet; then
+            echo "Cask already at ${VERSION}; nothing to do."
+            exit 0
+          fi
+          git commit -qam "⬆️ arrow-up(${CASK}): bump cask to ${VERSION}"
+
+          # Several apps share one tap, and two can release the same afternoon.
+          # Rebase onto whatever landed meanwhile and try again.
+          for attempt in 1 2 3; do
+            if git push -q origin HEAD; then
+              echo "✅ ${CASK} → ${VERSION}"
+              exit 0
+            fi
+            echo "::warning::Push rejected (attempt ${attempt}); rebasing"
+            sleep $((attempt * 5))
+            git pull -q --rebase origin HEAD
+          done
+          echo "::error::Could not push to ${TAP} after 3 attempts"
+          exit 1

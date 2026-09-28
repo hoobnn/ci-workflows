@@ -1,6 +1,6 @@
 # ci-workflows
 
-跨项目复用的 GitHub Actions —— macOS 应用的签名、公证与发布。
+跨项目复用的 GitHub Actions —— macOS 应用的签名、公证、发布，以及同步 Homebrew cask。
 
 仓库需要保持 **public**：个人账号下跨仓库调用 reusable workflow 要求被调用方公开。
 这里只有构建逻辑，没有任何凭据，公开无风险。
@@ -42,6 +42,46 @@ Variables：`APPLE_TEAM_ID`、`APPLE_SIGN_IDENTITY_APPLICATION`
 
 `.pkg` 分发时另加 `APPLE_CERT_INSTALLER_P12_BASE64`、`APPLE_CERT_INSTALLER_P12_PASSWORD`
 与 `APPLE_SIGN_IDENTITY_INSTALLER`。
+
+## 同步 Homebrew cask
+
+`homebrew-cask.yml` 在 Release 发布后，用 Release 里的 `.dmg.sha256` 改写 tap 中 cask 的
+`version` 与 `sha256` 并推送。只应在打标签时调用：
+
+```yaml
+  homebrew:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: hoobnn/ci-workflows/.github/workflows/homebrew-cask.yml@v1
+    with:
+      cask: my-app                                   # Casks/my-app.rb
+      artifact-basename: My-App                      # 与 macos-release 相同
+      version: ${{ needs.release.outputs.version }}
+    secrets: inherit
+```
+
+| 名称 | 必填 | 说明 |
+|---|---|---|
+| `cask` | ✅ | cask 名，即 `Casks/` 下的文件名（不含 `.rb`） |
+| `artifact-basename` | ✅ | 与 `macos-release.yml` 相同 |
+| `version` | ✅ | 发布的版本号 |
+| `tap` | | tap 仓库，默认 `hoobnn/homebrew-tap` |
+
+需要 secret `HOMEBREW_TAP_TOKEN`：fine-grained token，只授权 tap 仓库的 Contents 读写。
+缺失时流程直接失败 —— cask 停在旧版本的 sha256 时 `brew install` 会校验失败，悄悄跳过比报错更糟。
+多个应用共用一个 tap，推送被拒时会 rebase 后重试。
+
+## 调用方的推荐结构
+
+```text
+.github/workflows/ci.yml       push main / PR / workflow_call → 单元测试
+.github/workflows/release.yml  v* 标签 → ci.yml → macos-release.yml → homebrew-cask.yml
+```
+
+- 测试只在 `ci.yml` 定义一次，`release.yml` 以 `uses: ./.github/workflows/ci.yml` 复用
+- 顶层 `permissions: contents: read`，只给发布任务 `contents: write`
+- CI 按分支 `concurrency` 并取消旧运行；发布不取消，公证做到一半被中断最麻烦
+- 第三方 action 钉到 commit SHA，官方 `actions/*` 用大版本号
 
 ## 这里固化的几个约定
 
