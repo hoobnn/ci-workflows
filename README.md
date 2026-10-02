@@ -1,9 +1,10 @@
-# ci-workflows
+# ci-workflows：macOS 应用签名、公证与发布的复用 GitHub Actions
 
-跨项目复用的 GitHub Actions —— macOS 应用的签名、公证、发布，以及同步 Homebrew cask。
+**简体中文** · [English](README.en.md)
 
-仓库需要保持 **public**：个人账号下跨仓库调用 reusable workflow 要求被调用方公开。
-这里只有构建逻辑，没有任何凭据，公开无风险。
+我的几个 macOS 应用（[fanfan](https://github.com/hoobnn/fanfan)、[LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge)、[Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix)）共用的发布流程：Developer ID 签名、Apple 公证、发 GitHub Release，再同步 Homebrew cask。
+
+这个仓库必须是公开的，因为个人账号下跨仓库调用 reusable workflow 要求被调用的仓库公开。这里只有构建逻辑，凭据都在调用方的 secrets 里。
 
 ## 用法
 
@@ -68,7 +69,7 @@ Variables：`APPLE_TEAM_ID`、`APPLE_SIGN_IDENTITY_APPLICATION`
 | `tap` | | tap 仓库，默认 `hoobnn/homebrew-tap` |
 
 需要 secret `HOMEBREW_TAP_TOKEN`：fine-grained token，只授权 tap 仓库的 Contents 读写。
-缺失时流程直接失败 —— cask 停在旧版本的 sha256 时 `brew install` 会校验失败，悄悄跳过比报错更糟。
+没配这个 secret 时流程会直接失败。故意不跳过：cask 停在旧版本的 sha256 时 `brew install` 会校验失败，悄悄跳过比报错更难排查。
 多个应用共用一个 tap，推送被拒时会 rebase 后重试。
 
 ## 调用方的推荐结构
@@ -80,18 +81,18 @@ Variables：`APPLE_TEAM_ID`、`APPLE_SIGN_IDENTITY_APPLICATION`
 
 - 测试只在 `ci.yml` 定义一次，`release.yml` 以 `uses: ./.github/workflows/ci.yml` 复用
 - 顶层 `permissions: contents: read`，只给发布任务 `contents: write`
-- CI 按分支 `concurrency` 并取消旧运行；发布不取消，公证做到一半被中断最麻烦
+- CI 按分支设 `concurrency` 并取消旧的运行；发布不取消，公证做到一半被打断最麻烦
 - 第三方 action 钉到 commit SHA，官方 `actions/*` 用大版本号
 
-## 这里固化的几个约定
+## 踩过坑之后定下的做法
 
-- **签名顺序内层优先，不用 `--deep`** —— `--deep` 已废弃，且会把外层的签名参数套用到嵌套代码上
-- **必须 `--options runtime` + `--timestamp`** —— 前者缺失公证必被拒；后者缺失会让证书过期后已发布的产物失效
-- **打包用 `ditto` 而非 `zip`** —— stapled ticket 存在扩展属性里，`zip` 会丢
-- **dmg 单独签名、单独公证、单独 staple** —— 容器是独立产物，里面的 app 已公证不代表容器可以免除
-- **临时钥匙串密码用 `uuidgen`** —— 用完即弃，没必要占用一个需要跨仓库同步的 secret
-- **公证失败自动拉 `notarytool log`** —— Apple 只在这里说明真实原因
-- **tag 必须与 `CFBundleShortVersionString` 一致** —— 否则用户下载到的版本号对不上
+- 先签内层二进制，再签外层，不用 `--deep`。`--deep` 已经废弃，还会把外层的签名参数套到嵌套代码上。
+- 一定带 `--options runtime` 和 `--timestamp`。少了前者公证直接被拒；少了后者，证书过期后已经发出去的包会失效。
+- 打包用 `ditto`，不用 `zip`。staple 进去的公证票据存在扩展属性里，`zip` 会把它丢掉。
+- dmg 要单独签名、单独公证、单独 staple。里面的 app 公证过了，不代表外面的 dmg 也算公证过。
+- 临时钥匙串的密码用 `uuidgen` 现生成，用完就扔，不值得为它再建一个要跨仓库同步的 secret。
+- 公证失败时自动拉 `notarytool log`，真实原因只在这里能看到。
+- tag 必须和 `CFBundleShortVersionString` 一致，不然用户下到的版本号对不上。
 
 ## 版本
 
@@ -100,3 +101,7 @@ Variables：`APPLE_TEAM_ID`、`APPLE_SIGN_IDENTITY_APPLICATION`
 ```bash
 git tag -fa v1 -m "..." && git push -f origin v1
 ```
+
+## 许可
+
+[MIT](LICENSE)
