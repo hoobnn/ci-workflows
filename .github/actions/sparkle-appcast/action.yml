@@ -1,0 +1,47 @@
+name: Sparkle appcast
+description: >
+  Write a Sparkle appcast.xml built from the repository's GitHub Releases. Each
+  release must carry the zip and the .zip.sparkle.json that macos-release.yml
+  publishes with `sparkle: true`. Releases without that metadata are skipped.
+
+inputs:
+  output:
+    description: Where to write the appcast, e.g. _site/appcast.xml
+    required: true
+  artifact-basename:
+    description: Same value given to macos-release.yml
+    required: true
+  title:
+    description: Feed title, normally the app name
+    required: true
+  max-items:
+    description: Newest N releases to list
+    required: false
+    default: "10"
+  include-prereleases:
+    description: Also list prereleases
+    required: false
+    default: "false"
+  repository:
+    description: owner/name to read releases from
+    required: false
+    default: ${{ github.repository }}
+  token:
+    description: Token for the GitHub API
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: ✨ Build appcast from releases
+      shell: bash
+      env:
+        OUTPUT: ${{ inputs.output }}
+        BASENAME: ${{ inputs.artifact-basename }}
+        TITLE: ${{ inputs.title }}
+        MAX_ITEMS: ${{ inputs.max-items }}
+        INCLUDE_PRERELEASES: ${{ inputs.include-prereleases }}
+        REPOSITORY: ${{ inputs.repository }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: python3 "$GITHUB_ACTION_PATH/appcast.py"

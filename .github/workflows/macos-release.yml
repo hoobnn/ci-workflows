@@ -47,6 +47,13 @@ on:
         required: false
         type: string
         default: ""
+      sparkle:
+        description: >
+          Sign the zip for Sparkle updates (needs the SPARKLE_ED_PRIVATE_KEY
+          secret) and publish its metadata next to it, for the sparkle-appcast action.
+        required: false
+        type: boolean
+        default: false
     outputs:
       version:
         description: Version taken from the app's CFBundleShortVersionString
@@ -165,6 +172,51 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: ✨ Sign zip for Sparkle
+        if: inputs.sparkle
+        env:
+          APP_PATH: ${{ inputs.app-path }}
+          ZIP: ${{ steps.package.outputs.zip }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          # Pinned: the tools sign what users install, so the download is checked.
+          SPARKLE_VERSION: "2.10.0"
+          SPARKLE_SHA256: c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SPARKLE_ED_PRIVATE_KEY" ]; then
+            echo "::error::sparkle: true needs the SPARKLE_ED_PRIVATE_KEY secret"
+            exit 1
+          fi
+
+          TOOLS="$RUNNER_TEMP/sparkle"
+          mkdir -p "$TOOLS"
+          curl -fsSL -o "$TOOLS/sparkle.tar.xz" \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          echo "$SPARKLE_SHA256  $TOOLS/sparkle.tar.xz" | shasum -a 256 -c -
+          tar -xf "$TOOLS/sparkle.tar.xz" -C "$TOOLS" ./bin/sign_update
+
+          # The key goes in through stdin and never touches the disk.
+          SIG=$(printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$TOOLS/bin/sign_update" --ed-key-file - "$ZIP")
+          ED_SIGNATURE=$(sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/' <<<"$SIG")
+          LENGTH=$(sed -E 's/.*length="([0-9]+)".*/\1/' <<<"$SIG")
+
+          # Everything an appcast item needs, published as a release asset so the
+          # feed can be rebuilt from releases alone.
+          PLIST="$APP_PATH/Contents/Info.plist"
+          read_plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$PLIST" 2>/dev/null || true; }
+          jq -n \
+            --arg file "$(basename "$ZIP")" \
+            --arg ed "$ED_SIGNATURE" \
+            --argjson length "$LENGTH" \
+            --arg version "$(read_plist CFBundleVersion)" \
+            --arg short "$(read_plist CFBundleShortVersionString)" \
+            --arg min "$(read_plist LSMinimumSystemVersion)" \
+            '{file: $file, edSignature: $ed, length: $length, version: $version,
+              shortVersion: $short, minimumSystemVersion: $min}' \
+            > "${ZIP}.sparkle.json"
+          cat "${ZIP}.sparkle.json"
 
       - name: 💿 Build and sign dmg
         id: dmg

@@ -2,7 +2,7 @@
 
 [简体中文](README.md) · **English**
 
-A reusable release pipeline for macOS apps: Developer ID signing, Apple notarization, a GitHub Release, then a Homebrew cask bump. It currently serves [fanfan](https://github.com/hoobnn/fanfan), [LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge) and [Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix).
+A reusable release pipeline for macOS apps: Developer ID signing, Apple notarization, a GitHub Release, a Homebrew cask bump, and a Sparkle appcast for in-app updates. It currently serves [fanfan](https://github.com/hoobnn/fanfan), [LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge) and [Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix).
 
 The repo has to stay public: on a personal account, a reusable workflow can only be called from another repo if it's public. There are no credentials here, only build logic; secrets live in the calling repo.
 
@@ -33,6 +33,7 @@ jobs:
 | `dmg-volume-name` | | dmg volume name, defaults to `artifact-basename` |
 | `runs-on` | | Runner, default `macos-15` |
 | `release-notes-file` | | File to use as the release body; `--generate-notes` if omitted |
+| `sparkle` | | Sign the zip for Sparkle updates and publish a `.zip.sparkle.json` with the release; default `false`; needs the `SPARKLE_ED_PRIVATE_KEY` secret |
 
 ### Credentials the caller needs
 
@@ -68,6 +69,41 @@ After a release is published, `homebrew-cask.yml` reads the `.dmg.sha256` from t
 | `tap` | | Tap repo, default `hoobnn/homebrew-tap` |
 
 It needs a `HOMEBREW_TAP_TOKEN` secret: a fine-grained token with Contents read/write on the tap repo only. Without it the job fails on purpose. If the cask kept the old sha256, `brew install` would fail its checksum, and silently skipping is harder to debug than an error. Several apps share one tap, so a rejected push is rebased and retried.
+
+## Sparkle in-app updates
+
+The appcast is not committed. It is built from GitHub Releases whenever Pages deploys:
+
+1. With `sparkle: true`, `macos-release.yml` signs the zip with `SPARKLE_ED_PRIVATE_KEY` (EdDSA) and
+   publishes the signature, length and bundle versions as `<basename>-<version>-macOS.zip.sparkle.json`
+   next to it. The Sparkle tools are pinned to 2.10.0 and checked by SHA-256; the key only goes in via stdin.
+2. The caller's Pages workflow runs the `sparkle-appcast` action to write `appcast.xml` from all releases:
+
+```yaml
+      - uses: hoobnn/ci-workflows/.github/actions/sparkle-appcast@v1
+        with:
+          output: _site/appcast.xml
+          artifact-basename: My-App          # same as macos-release
+          title: My App
+```
+
+| Name | Required | Description |
+|---|---|---|
+| `output` | ✅ | Where to write the appcast |
+| `artifact-basename` | ✅ | Same as `macos-release.yml` |
+| `title` | ✅ | Feed title, normally the app name |
+| `max-items` | | Newest N releases to list, default `10` |
+| `include-prereleases` | | Include prereleases, default `false` |
+
+3. Call the Pages workflow once after releasing (give it a `workflow_call` trigger) so the feed updates
+   right away. Releases and pushes made with `GITHUB_TOKEN` do not trigger other workflows, so
+   `release: published` cannot be relied on.
+
+Releases without a `.zip.sparkle.json` are skipped; deleting a release drops its item.
+Point the app's `SUFeedURL` at `appcast.xml` on Pages (`*.github.io` is usually reachable from mainland
+China where `raw.githubusercontent.com` often is not) and set `SUPublicEDKey` to the matching public key.
+Use one key pair per app: `generate_keys --account <app>`, then `generate_keys --account <app> -x <file>`
+to export the private key into the secret.
 
 ## Suggested layout in the calling repo
 
