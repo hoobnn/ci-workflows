@@ -2,7 +2,7 @@
 
 [简体中文](README.md) · **English**
 
-The release pipeline shared by my macOS apps ([fanfan](https://github.com/hoobnn/fanfan), [LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge), [Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix)): Developer ID signing, Apple notarization, a GitHub Release, then a Homebrew cask bump.
+A reusable release pipeline for macOS apps: Developer ID signing, Apple notarization, a GitHub Release, then a Homebrew cask bump. It currently serves [fanfan](https://github.com/hoobnn/fanfan), [LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge) and [Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix).
 
 The repo has to stay public: on a personal account, a reusable workflow can only be called from another repo if it's public. There are no credentials here, only build logic; secrets live in the calling repo.
 
@@ -81,13 +81,13 @@ It needs a `HOMEBREW_TAP_TOKEN` secret: a fine-grained token with Contents read/
 - CI uses per-branch `concurrency` and cancels stale runs; releases don't cancel, because an interrupted notarization is the worst case
 - Pin third-party actions to a commit SHA; official `actions/*` use major versions
 
-## Choices made after hitting the problems
+## Lessons learned
 
 - Sign inner binaries first, then the outer bundle, without `--deep`. `--deep` is deprecated and applies the outer signing options to nested code.
 - Always pass `--options runtime` and `--timestamp`. Without the first, notarization is rejected; without the second, shipped builds stop validating once the certificate expires.
 - Package with `ditto`, not `zip`. The stapled ticket lives in extended attributes, and `zip` drops them.
 - Sign, notarize and staple the dmg on its own. A notarized app inside doesn't make the container notarized.
-- Generate the temporary keychain password with `uuidgen` and throw it away; it isn't worth a secret that has to be synced across repos.
+- Generate the temporary keychain password with `uuidgen` and discard it after use; it doesn't warrant a secret synced across repos.
 - On notarization failure, fetch `notarytool log` automatically. It's the only place Apple gives the real reason.
 - The tag must match `CFBundleShortVersionString`, or users download a build whose version doesn't match.
 
