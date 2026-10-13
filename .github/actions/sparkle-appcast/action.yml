@@ -11,6 +11,10 @@ inputs:
   artifact-basename:
     description: Same value given to macos-release.yml
     required: true
+  artifact-suffix:
+    description: Same artifact-suffix output macos-release.yml reports ("" unless arch-suffix)
+    required: false
+    default: ""
   title:
     description: Feed title, normally the app name
     required: true
@@ -39,6 +43,7 @@ runs:
       env:
         OUTPUT: ${{ inputs.output }}
         BASENAME: ${{ inputs.artifact-basename }}
+        ARTIFACT_SUFFIX: ${{ inputs.artifact-suffix }}
         TITLE: ${{ inputs.title }}
         MAX_ITEMS: ${{ inputs.max-items }}
         INCLUDE_PRERELEASES: ${{ inputs.include-prereleases }}

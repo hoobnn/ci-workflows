@@ -30,6 +30,13 @@ on:
         description: Released version, normally needs.release.outputs.version
         required: true
         type: string
+      artifact-suffix:
+        description: >
+          Suffix after "-macOS" in file names, normally
+          needs.release.outputs.artifact-suffix (set when macos-release.yml uses arch-suffix)
+        required: false
+        type: string
+        default: ""
       tap:
         description: Tap repository as owner/name
         required: false
@@ -55,7 +62,7 @@ jobs:
         id: checksum
         env:
           GH_TOKEN: ${{ github.token }}
-          FILE: ${{ inputs.artifact-basename }}-${{ inputs.version }}-macOS.dmg.sha256
+          FILE: ${{ inputs.artifact-basename }}-${{ inputs.version }}-macOS${{ inputs.artifact-suffix }}.dmg.sha256
         run: |
           set -euo pipefail
           gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \

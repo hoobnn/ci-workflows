@@ -49,6 +49,20 @@ runs:
       run: |
         set -euo pipefail
 
+        # An empty secret otherwise surfaces as an opaque base64 or keychain error.
+        missing=0
+        for pair in "application-p12-base64:$APPLICATION_P12_BASE64" "application-identity:$APPLICATION_IDENTITY"; do
+          if [ -z "${pair#*:}" ]; then
+            echo "::error::apple-signing: ${pair%%:*} is empty — is its secret or variable set in this repository?"
+            missing=1
+          fi
+        done
+        if [ -n "$INSTALLER_IDENTITY" ] && [ -z "$INSTALLER_P12_BASE64" ]; then
+          echo "::error::apple-signing: installer-identity is set but installer-p12-base64 is empty"
+          missing=1
+        fi
+        [ "$missing" -eq 0 ] || exit 1
+
         KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
         # Ephemeral: this keychain lives and dies with the job, so a random
         # password beats one stored as a secret and synced across repos.

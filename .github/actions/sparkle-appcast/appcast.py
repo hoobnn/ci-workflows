@@ -1,6 +1,6 @@
 """Build a Sparkle appcast from GitHub Releases.
 
-Each release item comes from the `<basename>-<version>-macOS.zip.sparkle.json`
+Each release item comes from the `<basename>-<version>-macOS<suffix>.zip.sparkle.json`
 asset that macos-release.yml writes when `sparkle: true`: the EdDSA signature,
 the zip's length and the bundle versions. Nothing else is trusted for those.
 """
@@ -47,8 +47,8 @@ def release_notes_html(body: str) -> str:
 
 
 def build(releases: list[dict], fetch_asset, *, basename: str, title: str, link: str,
-          max_items: int, include_prereleases: bool) -> str:
-    pattern = re.compile(rf"^{re.escape(basename)}-.+-macOS\.zip\.sparkle\.json$")
+          max_items: int, include_prereleases: bool, suffix: str = "") -> str:
+    pattern = re.compile(rf"^{re.escape(basename)}-.+-macOS{re.escape(suffix)}\.zip\.sparkle\.json$")
     items = []
     for rel in releases:
         if rel.get("draft") or (rel.get("prerelease") and not include_prereleases):
@@ -109,6 +109,7 @@ def main() -> None:
         list_releases(repo, token),
         lambda asset: api_get(asset["url"], token, "application/octet-stream"),
         basename=os.environ["BASENAME"],
+        suffix=os.environ.get("ARTIFACT_SUFFIX", ""),
         title=os.environ["TITLE"],
         link=f"https://github.com/{repo}",
         max_items=int(os.environ.get("MAX_ITEMS") or 10),

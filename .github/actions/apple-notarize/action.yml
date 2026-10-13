@@ -42,6 +42,15 @@ runs:
       run: |
         set -euo pipefail
 
+        missing=0
+        for pair in "api-key-id:$API_KEY_ID" "api-issuer-id:$API_ISSUER_ID" "api-key-base64:$API_KEY_BASE64"; do
+          if [ -z "${pair#*:}" ]; then
+            echo "::error::apple-notarize: ${pair%%:*} is empty — is its secret set in this repository?"
+            missing=1
+          fi
+        done
+        [ "$missing" -eq 0 ] || exit 1
+
         KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
         CLEANUP_ZIP=""
         cleanup() {

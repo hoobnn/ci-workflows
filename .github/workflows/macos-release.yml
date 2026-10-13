@@ -8,9 +8,21 @@ on:
         required: true
         type: string
       build-command:
-        description: Shell command that produces the .app
-        required: true
+        description: >
+          Shell command that produces the .app. Give exactly one of
+          build-command and app-artifact.
+        required: false
         type: string
+        default: ""
+      app-artifact:
+        description: >
+          Name of an artifact uploaded earlier in the same run that holds the
+          .app as a single tar (tar -cf app.tar -C <dir of app-path> <App>.app),
+          so the caller can build with its own setup and caches. A tar keeps the
+          symlinks and modes that upload-artifact's zip would drop.
+        required: false
+        type: string
+        default: ""
       artifact-basename:
         description: Base name for release files, e.g. "Keyboard-Logo-Fix"
         required: true
@@ -18,7 +30,16 @@ on:
       inner-binaries:
         description: >
           Newline-separated paths (relative to the .app) of nested binaries that
-          must be signed before the outer bundle. Leave empty for a single-binary app.
+          must be signed before the outer bundle, or `auto` to find every nested
+          Mach-O file and code bundle and sign them innermost first. Leave empty
+          for a single-binary app.
+        required: false
+        type: string
+        default: ""
+      inner-entitlements:
+        description: >
+          .entitlements file applied to every inner binary. Electron helpers
+          need it (allow-jit and friends) or they crash under the hardened runtime.
         required: false
         type: string
         default: ""
@@ -37,6 +58,20 @@ on:
         required: false
         type: string
         default: ""
+      arch-suffix:
+        description: >
+          Append the app's architecture to file names (-arm64, -x64 or
+          -universal), read from the main executable with lipo.
+        required: false
+        type: boolean
+        default: false
+      sign:
+        description: >
+          false runs a dry run without credentials: ad-hoc signature, no
+          notarization, no Sparkle signature, no release; only the artifacts.
+        required: false
+        type: boolean
+        default: true
       runs-on:
         description: Runner image — pin it, `macos-latest` moves under you
         required: false
@@ -58,6 +93,9 @@ on:
       version:
         description: Version taken from the app's CFBundleShortVersionString
         value: ${{ jobs.release.outputs.version }}
+      artifact-suffix:
+        description: Suffix after "-macOS" in file names ("" unless arch-suffix), for homebrew-cask and sparkle-appcast
+        value: ${{ jobs.release.outputs.artifact-suffix }}
 
 permissions:
   contents: write
@@ -68,16 +106,63 @@ jobs:
     # Notarization usually takes minutes; an hour means Apple's queue is stuck.
     timeout-minutes: 60
     # Forks cannot read secrets; skip rather than fail with a confusing error.
-    if: github.event.repository.fork == false
+    # A dry run needs none, so it runs anywhere.
+    if: ${{ !inputs.sign || github.event.repository.fork == false }}
     outputs:
       version: ${{ steps.package.outputs.version }}
+      artifact-suffix: ${{ steps.package.outputs.suffix }}
 
     steps:
+      - name: 🧾 Check inputs and credentials
+        env:
+          SIGN: ${{ inputs.sign }}
+          SPARKLE: ${{ inputs.sparkle }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          APP_ARTIFACT: ${{ inputs.app-artifact }}
+          APPLE_CERT_APPLICATION_P12_BASE64: ${{ secrets.APPLE_CERT_APPLICATION_P12_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_SIGN_IDENTITY_APPLICATION: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if { [ -n "$BUILD_COMMAND" ] && [ -n "$APP_ARTIFACT" ]; } \
+             || { [ -z "$BUILD_COMMAND" ] && [ -z "$APP_ARTIFACT" ]; }; then
+            echo "::error::Give exactly one of build-command and app-artifact"
+            exit 1
+          fi
+
+          [ "$SIGN" = true ] || { echo "Dry run: no credentials needed."; exit 0; }
+
+          # Name every missing credential at once, before a runner minute is spent
+          # on building; an empty secret otherwise surfaces as a keychain error.
+          required=(APPLE_CERT_APPLICATION_P12_BASE64 APPLE_NOTARY_KEY_ID
+                    APPLE_NOTARY_ISSUER_ID APPLE_NOTARY_KEY_P8_BASE64
+                    APPLE_SIGN_IDENTITY_APPLICATION)
+          [ "$SPARKLE" = true ] && required+=(SPARKLE_ED_PRIVATE_KEY)
+          missing=()
+          for name in "${required[@]}"; do
+            [ -n "${!name:-}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            for name in "${missing[@]}"; do
+              kind=secret
+              [ "$name" = APPLE_SIGN_IDENTITY_APPLICATION ] && kind=variable
+              echo "::error::Missing $kind $name"
+            done
+            echo "::error::Add them under Settings → Secrets and variables → Actions, or call with sign: false for a dry run."
+            exit 1
+          fi
+          echo "✅ Credentials present"
+
       - name: 📥 Checkout
         uses: actions/checkout@v7
 
       - name: 🔑 Import signing certificates
         id: signing
+        if: inputs.sign
         uses: hoobnn/ci-workflows/.github/actions/apple-signing@v1
         with:
           application-p12-base64: ${{ secrets.APPLE_CERT_APPLICATION_P12_BASE64 }}
@@ -88,26 +173,93 @@ jobs:
           installer-identity: ${{ vars.APPLE_SIGN_IDENTITY_INSTALLER }}
 
       - name: 🔨 Build
+        if: inputs.build-command != ''
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           # Build scripts may sign inline; hand them the real identity so a
           # local ad-hoc default does not silently win.
-          APPLE_SIGN_IDENTITY_APPLICATION: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
+          APPLE_SIGN_IDENTITY_APPLICATION: ${{ inputs.sign && vars.APPLE_SIGN_IDENTITY_APPLICATION || '' }}
         run: ${{ inputs.build-command }}
 
-      - name: ✍️ Code-sign with Developer ID
+      - name: 📦 Download prebuilt app
+        if: inputs.app-artifact != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.app-artifact }}
+          path: ${{ runner.temp }}/app-artifact
+
+      - name: 📂 Unpack prebuilt app
+        if: inputs.app-artifact != ''
+        env:
+          APP_PATH: ${{ inputs.app-path }}
+          SRC: ${{ runner.temp }}/app-artifact
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tars=("$SRC"/*.tar)
+          [ "${#tars[@]}" -eq 1 ] || { echo "::error::app-artifact must hold exactly one .tar, found ${#tars[@]}"; exit 1; }
+          mkdir -p "$(dirname "$APP_PATH")"
+          tar -xf "${tars[0]}" -C "$(dirname "$APP_PATH")"
+          test -d "$APP_PATH" || { echo "::error::$(basename "${tars[0]}") does not unpack to $APP_PATH"; exit 1; }
+
+      - name: ✍️ Code-sign
         env:
           APP_PATH: ${{ inputs.app-path }}
           INNER_BINARIES: ${{ inputs.inner-binaries }}
+          INNER_ENTITLEMENTS: ${{ inputs.inner-entitlements }}
           ENTITLEMENTS: ${{ inputs.entitlements }}
+          SIGN: ${{ inputs.sign }}
           SIGN_IDENTITY: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
         run: |
           set -euo pipefail
 
           test -d "$APP_PATH" || { echo "::error::App not found: $APP_PATH"; exit 1; }
+          for f in "$ENTITLEMENTS" "$INNER_ENTITLEMENTS"; do
+            [ -z "$f" ] || test -f "$f" || { echo "::error::Entitlements not found: $f"; exit 1; }
+          done
+
+          if [ "$SIGN" = true ]; then
+            BASE_ARGS=(--force --timestamp --options runtime --sign "$SIGN_IDENTITY")
+          else
+            # Ad-hoc keeps the bundle structure honest without a certificate;
+            # Apple's timestamp server only stamps real identities.
+            echo "::notice::Dry run: ad-hoc signature, the app will not pass Gatekeeper"
+            BASE_ARGS=(--force --timestamp=none --options runtime --sign -)
+          fi
+          INNER_ARGS=("${BASE_ARGS[@]}")
+          [ -z "$INNER_ENTITLEMENTS" ] || INNER_ARGS+=(--entitlements "$INNER_ENTITLEMENTS")
+          OUTER_ARGS=("${BASE_ARGS[@]}")
+          [ -z "$ENTITLEMENTS" ] || OUTER_ARGS+=(--entitlements "$ENTITLEMENTS")
 
           # Strip quarantine/extended attrs that would break the seal.
           xattr -cr "$APP_PATH"
+
+          # Every nested Mach-O file and code bundle, deepest path first, so each
+          # bundle is sealed after the code inside it. The main executable is
+          # left to the outer signature. find does not follow symlinks, so a
+          # framework's Versions/Current alias is not signed twice.
+          discover_inner() {
+            local main
+            main="$APP_PATH/Contents/MacOS/$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")"
+            {
+              find "$APP_PATH/Contents" -type f -print0 | while IFS= read -r -d '' f; do
+                [ "$f" = "$main" ] && continue
+                case "$(file -b "$f")" in Mach-O*) printf '%s\n' "$f" ;; esac
+              done
+              find "$APP_PATH/Contents" -mindepth 1 -type d \
+                \( -name '*.app' -o -name '*.framework' -o -name '*.xpc' -o -name '*.appex' \) -print
+              # Plugin bundles carry code; resource-only .bundle dirs cannot be signed.
+              find "$APP_PATH/Contents" -mindepth 1 -type d -name '*.bundle' -print | while IFS= read -r b; do
+                [ -d "$b/Contents/MacOS" ] && printf '%s\n' "$b"
+              done
+            } | awk -F/ '{ print NF "\t" $0 }' | sort -t $'\t' -k1,1nr -k2,2 | cut -f2- \
+              | sed "s|^$APP_PATH/||"
+          }
+
+          if [ "$(tr -d '[:space:]' <<<"$INNER_BINARIES")" = auto ]; then
+            INNER_BINARIES=$(discover_inner)
+            echo "🔎 Found $(grep -c . <<<"$INNER_BINARIES" || true) nested items to sign"
+          fi
 
           # Inner-most first. `--deep` is deprecated and signs nested code with
           # the outer bundle's flags, which is wrong for helper binaries.
@@ -117,24 +269,18 @@ jobs:
               target="$APP_PATH/$rel"
               test -e "$target" || { echo "::error::Inner binary missing: $target"; exit 1; }
               echo "✍️  Signing inner: $rel"
-              codesign --force --timestamp --options runtime \
-                --sign "$SIGN_IDENTITY" "$target"
+              codesign "${INNER_ARGS[@]}" "$target"
             done <<< "$INNER_BINARIES"
           fi
 
-          SIGN_ARGS=(--force --timestamp --options runtime --sign "$SIGN_IDENTITY")
-          if [ -n "$ENTITLEMENTS" ]; then
-            test -f "$ENTITLEMENTS" || { echo "::error::Entitlements not found: $ENTITLEMENTS"; exit 1; }
-            SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
-          fi
-
           echo "✍️  Signing bundle: $APP_PATH"
-          codesign "${SIGN_ARGS[@]}" "$APP_PATH"
+          codesign "${OUTER_ARGS[@]}" "$APP_PATH"
 
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-          codesign --display --verbose=4 "$APP_PATH" 2>&1 | grep -E "Authority|TeamIdentifier|flags"
+          codesign --display --verbose=4 "$APP_PATH" 2>&1 | grep -E "Authority|TeamIdentifier|flags|Signature="
 
       - name: 📜 Notarize and staple the app
+        if: inputs.sign
         uses: hoobnn/ci-workflows/.github/actions/apple-notarize@v1
         with:
           path: ${{ inputs.app-path }}
@@ -147,11 +293,12 @@ jobs:
         env:
           APP_PATH: ${{ inputs.app-path }}
           BASENAME: ${{ inputs.artifact-basename }}
+          ARCH_SUFFIX: ${{ inputs.arch-suffix }}
         run: |
           set -euo pipefail
 
-          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
-            "$APP_PATH/Contents/Info.plist")
+          PLIST="$APP_PATH/Contents/Info.plist"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")
 
           # A tag must agree with the bundle, or users get a version that does
           # not match what they downloaded.
@@ -163,18 +310,33 @@ jobs:
             fi
           fi
 
+          SUFFIX=""
+          if [ "$ARCH_SUFFIX" = true ]; then
+            EXE="$APP_PATH/Contents/MacOS/$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST")"
+            ARCHS=$(lipo -archs "$EXE")
+            case " $ARCHS " in
+              *" arm64 "*" x86_64 "* | *" x86_64 "*" arm64 "*) SUFFIX=-universal ;;
+              " arm64 ") SUFFIX=-arm64 ;;
+              " x86_64 ") SUFFIX=-x64 ;;
+              *) echo "::error::Unexpected architectures in $EXE: $ARCHS"; exit 1 ;;
+            esac
+          fi
+
           mkdir -p dist-release
-          ZIP="dist-release/${BASENAME}-${VERSION}-macOS.zip"
+          ZIP="dist-release/${BASENAME}-${VERSION}-macOS${SUFFIX}.zip"
           # ditto preserves the xattrs holding the stapled ticket; zip does not.
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP"
           # Record the bare filename so `shasum -c` works where users unpack it.
           (cd dist-release && shasum -a 256 "$(basename "$ZIP")" | tee "$(basename "$ZIP").sha256")
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "suffix=$SUFFIX"
+            echo "zip=$ZIP"
+          } >> "$GITHUB_OUTPUT"
 
       - name: ✨ Sign zip for Sparkle
-        if: inputs.sparkle
+        if: inputs.sparkle && inputs.sign
         env:
           APP_PATH: ${{ inputs.app-path }}
           ZIP: ${{ steps.package.outputs.zip }}
@@ -184,11 +346,6 @@ jobs:
           SPARKLE_SHA256: c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
         run: |
           set -euo pipefail
-
-          if [ -z "$SPARKLE_ED_PRIVATE_KEY" ]; then
-            echo "::error::sparkle: true needs the SPARKLE_ED_PRIVATE_KEY secret"
-            exit 1
-          fi
 
           TOOLS="$RUNNER_TEMP/sparkle"
           mkdir -p "$TOOLS"
@@ -225,7 +382,9 @@ jobs:
           APP_PATH: ${{ inputs.app-path }}
           BASENAME: ${{ inputs.artifact-basename }}
           VERSION: ${{ steps.package.outputs.version }}
+          SUFFIX: ${{ steps.package.outputs.suffix }}
           VOLUME_NAME: ${{ inputs.dmg-volume-name || inputs.artifact-basename }}
+          SIGN: ${{ inputs.sign }}
           SIGN_IDENTITY: ${{ vars.APPLE_SIGN_IDENTITY_APPLICATION }}
         run: |
           set -euo pipefail
@@ -235,7 +394,7 @@ jobs:
           cp -R "$APP_PATH" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
 
-          DMG="dist-release/${BASENAME}-${VERSION}-macOS.dmg"
+          DMG="dist-release/${BASENAME}-${VERSION}-macOS${SUFFIX}.dmg"
           hdiutil create -volname "$VOLUME_NAME" \
             -srcfolder "$STAGE" \
             -ov -format UDZO \
@@ -244,12 +403,14 @@ jobs:
 
           # The container is a separate artifact: it needs its own signature,
           # notarization and staple even though the app inside already has all three.
-          codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+          if [ "$SIGN" = true ]; then
+            codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+          fi
 
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
 
       - name: 📜 Notarize and staple the dmg
-        if: inputs.make-dmg
+        if: inputs.make-dmg && inputs.sign
         uses: hoobnn/ci-workflows/.github/actions/apple-notarize@v1
         with:
           path: ${{ steps.dmg.outputs.dmg }}
@@ -269,12 +430,12 @@ jobs:
       - name: 📤 Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.artifact-basename }}-${{ steps.package.outputs.version }}
+          name: ${{ inputs.artifact-basename }}-${{ steps.package.outputs.version }}${{ steps.package.outputs.suffix }}${{ !inputs.sign && '-unsigned' || '' }}
           path: dist-release/*
           retention-days: 30
 
       - name: 🚀 Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && inputs.sign
         env:
           GH_TOKEN: ${{ github.token }}
           NOTES_FILE: ${{ inputs.release-notes-file }}
@@ -295,6 +456,7 @@ jobs:
           fi
 
       - name: 🧹 Delete signing keychain
-        if: always()
-        run: |
-          security delete-keychain "${{ steps.signing.outputs.keychain-path }}" 2>/dev/null || true
+        if: always() && steps.signing.outputs.keychain-path != ''
+        env:
+          KEYCHAIN_PATH: ${{ steps.signing.outputs.keychain-path }}
+        run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
