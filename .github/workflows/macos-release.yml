@@ -395,11 +395,18 @@ jobs:
           ln -s /Applications "$STAGE/Applications"
 
           DMG="dist-release/${BASENAME}-${VERSION}-macOS${SUFFIX}.dmg"
-          hdiutil create -volname "$VOLUME_NAME" \
-            -srcfolder "$STAGE" \
-            -ov -format UDZO \
-            -imagekey zlib-level=9 \
-            "$DMG"
+          # hdiutil create is deprecated from macOS 26; its replacement only
+          # exists there, so older runners keep hdiutil. diskutil makes an APFS
+          # volume, which opens on macOS 10.13 and later.
+          if diskutil image create from --help >/dev/null 2>&1; then
+            diskutil image create from --format UDZO --volumeName "$VOLUME_NAME" "$STAGE" "$DMG"
+          else
+            hdiutil create -volname "$VOLUME_NAME" \
+              -srcfolder "$STAGE" \
+              -ov -format UDZO \
+              -imagekey zlib-level=9 \
+              "$DMG"
+          fi
 
           # The container is a separate artifact: it needs its own signature,
           # notarization and staple even though the app inside already has all three.
