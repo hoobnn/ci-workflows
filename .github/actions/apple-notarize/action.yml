@@ -138,9 +138,26 @@ runs:
           exit 1
         fi
 
+        # stapler fetches the ticket from Apple's CloudKit, which often drops
+        # the connection on hosted runners (NSURLErrorDomain -1005, exit 68).
+        # The ticket is already issued at this point, so retry with backoff.
+        retry() {
+          local attempt=1 max=5 delay=15
+          until "$@"; do
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::Failed after $max attempts: $*"
+              return 1
+            fi
+            echo "::warning::Attempt $attempt failed: $*; retrying in ${delay}s"
+            sleep "$delay"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
+        }
+
         echo "📎 Stapling ticket onto $(basename "$TARGET_PATH")..."
-        xcrun stapler staple "$TARGET_PATH"
-        xcrun stapler validate "$TARGET_PATH"
+        retry xcrun stapler staple "$TARGET_PATH"
+        retry xcrun stapler validate "$TARGET_PATH"
 
         if [ -d "$TARGET_PATH" ]; then
           spctl --assess --type execute --verbose=2 "$TARGET_PATH"
