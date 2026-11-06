@@ -2,9 +2,19 @@
 
 [简体中文](README.md) · **English**
 
-A reusable release pipeline for macOS apps: Developer ID signing, Apple notarization, a GitHub Release, a Homebrew cask bump, and a Sparkle appcast for in-app updates. It currently serves [fanfan](https://github.com/hoobnn/fanfan), [LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge) [Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix) and [Plein](https://github.com/hoobnn/plein) (Electron).
+**ci-workflows** is a free, open-source (MIT) set of reusable GitHub Actions workflows that sign macOS apps with a Developer ID, notarize them with Apple and publish them as a GitHub Release, with an optional Homebrew cask bump and a Sparkle appcast for in-app updates. It handles native Xcode apps and Electron apps, and callers use it as `uses: hoobnn/ci-workflows/.github/workflows/macos-release.yml@v1`. It currently serves [fanfan](https://github.com/hoobnn/fanfan), [LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge), [Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix) and [Plein](https://github.com/hoobnn/plein) (Electron).
 
 The repo has to stay public: on a personal account, a reusable workflow can only be called from another repo if it's public. There are no credentials here, only build logic; secrets live in the calling repo.
+
+## What's included
+
+| Component | Kind | What it does |
+|---|---|---|
+| `macos-release.yml` | reusable workflow | Builds (or takes a prebuilt `.app`), signs inside-out, notarizes and staples, packages zip / dmg, publishes a GitHub Release |
+| `homebrew-cask.yml` | reusable workflow | After the Release, updates the cask's `version` and `sha256` in your tap |
+| `.github/actions/sparkle-appcast` | composite action | Builds a Sparkle `appcast.xml` from GitHub Releases |
+| `.github/actions/apple-signing` | composite action | Imports Developer ID certificates into a throwaway keychain (used inside `macos-release.yml`, callable on its own) |
+| `.github/actions/apple-notarize` | composite action | Submits to Apple notarization, waits, staples, and fetches the notary log on rejection (same) |
 
 ## Usage
 
@@ -19,6 +29,8 @@ jobs:
       make-dmg: true
     secrets: inherit
 ```
+
+The calling job or workflow must grant `contents: write` (the release is published with it; see the full example below).
 
 ### Inputs
 
@@ -47,6 +59,8 @@ Secrets: `APPLE_CERT_APPLICATION_P12_BASE64`, `APPLE_CERT_APPLICATION_P12_PASSWO
 `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`, `APPLE_NOTARY_KEY_P8_BASE64`
 
 Variables: `APPLE_TEAM_ID`, `APPLE_SIGN_IDENTITY_APPLICATION`
+
+With `sparkle` on, also the secret `SPARKLE_ED_PRIVATE_KEY`; syncing a Homebrew cask needs `HOMEBREW_TAP_TOKEN` (see below).
 
 For `.pkg` distribution, also `APPLE_CERT_INSTALLER_P12_BASE64`, `APPLE_CERT_INSTALLER_P12_PASSWORD`
 and `APPLE_SIGN_IDENTITY_INSTALLER`.
@@ -180,6 +194,20 @@ to export the private key into the secret.
 - Generate the temporary keychain password with `uuidgen` and discard it after use; it doesn't warrant a secret synced across repos.
 - On notarization failure, fetch `notarytool log` automatically. It's the only place Apple gives the real reason.
 - The tag must match `CFBundleShortVersionString`, or users download a build whose version doesn't match.
+
+## FAQ
+
+**Which apps does it work for?** Native Xcode / Swift apps and Electron apps. For apps that prepare their own runtime, build in your own job, upload the `.app` as a tar and hand it over with `app-artifact`; see "Build it yourself, sign it here".
+
+**Can I try it without an Apple developer certificate?** Yes. Pass `sign: false` for a dry run: ad-hoc signature, no notarization, no release, only the artifacts, and no credentials needed.
+
+**Why is this repo public, and does it leak credentials?** On a personal account, a reusable workflow called from another repo has to be public. The repo holds only build logic; certificates and keys live in the calling repo's secrets.
+
+**Notarization failed or timed out?** On rejection the workflow fetches and prints the `notarytool log`, and stapling and validation retry with backoff when the network drops. Common causes are a missing `--options runtime` / `--timestamp`, or Electron helpers without `inner-entitlements`; see "Lessons learned".
+
+**Should callers pin `@v1`?** Yes. `v1` is a tag that moves with fixes (see Versioning), so pinning it takes fixes without crossing a major version.
+
+**How does it compare with other options?** If one app just needs to sign and notarize, a single hand-written workflow or a community action may be enough. This one pays off when several apps share the same pipeline, with Sparkle appcast and Homebrew cask sync built in.
 
 ## Versioning
 

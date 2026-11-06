@@ -2,9 +2,19 @@
 
 **简体中文** · [English](README.en.md)
 
-可复用的 macOS 应用发布流程，依次完成 Developer ID 签名、Apple 公证、发布 GitHub Release、同步 Homebrew cask，以及生成 Sparkle 应用内更新的 appcast。目前用于 [fanfan](https://github.com/hoobnn/fanfan)、[LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge) 、[Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix) 和 [Plein](https://github.com/hoobnn/plein)（Electron）。
+**ci-workflows** 是免费开源（MIT）的 GitHub Actions reusable workflow 集合，用来给 macOS 应用做 Developer ID 签名、Apple 公证（notarization）并发布到 GitHub Release；可选同步 Homebrew cask，并生成 Sparkle 应用内更新的 appcast。支持原生 Xcode 应用和 Electron 应用，调用方用 `uses: hoobnn/ci-workflows/.github/workflows/macos-release.yml@v1` 引用。流程依次完成 Developer ID 签名、Apple 公证、发布 GitHub Release、同步 Homebrew cask，以及生成 Sparkle 应用内更新的 appcast。目前用于 [fanfan](https://github.com/hoobnn/fanfan)、[LiveTranslateBridge](https://github.com/hoobnn/livetranslate-bridge)、[Keyboard Logo Fix](https://github.com/hoobnn/macos-keyboard-logo-fix) 和 [Plein](https://github.com/hoobnn/plein)（Electron）。
 
 个人账号下跨仓库调用 reusable workflow 时，被调用的仓库必须公开，因此本仓库保持公开。仓库中只包含构建逻辑，凭据均保存在调用方的 secrets 中。
+
+## 包含什么
+
+| 组件 | 类型 | 作用 |
+|---|---|---|
+| `macos-release.yml` | reusable workflow | 构建（或接收已构建的 `.app`）、由内向外签名、公证并 staple、打包 zip / dmg、发布 GitHub Release |
+| `homebrew-cask.yml` | reusable workflow | Release 发布后更新 tap 里 cask 的 `version` 与 `sha256` |
+| `.github/actions/sparkle-appcast` | composite action | 从 GitHub Releases 生成 Sparkle `appcast.xml` |
+| `.github/actions/apple-signing` | composite action | 把 Developer ID 证书导入临时钥匙串（`macos-release.yml` 内部使用，也可单独调用） |
+| `.github/actions/apple-notarize` | composite action | 提交 Apple 公证、等待结果并 staple，失败时取回公证日志（同上） |
 
 ## 用法
 
@@ -19,6 +29,8 @@ jobs:
       make-dmg: true
     secrets: inherit
 ```
+
+调用方的 job 或 workflow 需要授予 `contents: write`（发布 Release 用，见下文完整示例）。
 
 ### 输入
 
@@ -47,6 +59,8 @@ Secrets：`APPLE_CERT_APPLICATION_P12_BASE64`、`APPLE_CERT_APPLICATION_P12_PASS
 `APPLE_NOTARY_KEY_ID`、`APPLE_NOTARY_ISSUER_ID`、`APPLE_NOTARY_KEY_P8_BASE64`
 
 Variables：`APPLE_TEAM_ID`、`APPLE_SIGN_IDENTITY_APPLICATION`
+
+开启 `sparkle` 时另需 secret `SPARKLE_ED_PRIVATE_KEY`；同步 Homebrew cask 需 `HOMEBREW_TAP_TOKEN`（见下文）。
 
 `.pkg` 分发时另加 `APPLE_CERT_INSTALLER_P12_BASE64`、`APPLE_CERT_INSTALLER_P12_PASSWORD`
 与 `APPLE_SIGN_IDENTITY_INSTALLER`。
@@ -181,6 +195,20 @@ appcast 不提交进仓库，而是在部署 Pages 时从 GitHub Releases 生成
 - 临时钥匙串的密码用 `uuidgen` 现生成，用完即弃，无需为此额外维护一个跨仓库同步的 secret。
 - 公证失败时自动获取 `notarytool log`，具体失败原因只能在这里看到。
 - tag 必须和 `CFBundleShortVersionString` 一致，否则用户下载到的版本号会不一致。
+
+## 常见问题
+
+**能用于哪些应用？** 原生 Xcode / Swift 应用和 Electron 应用都可以。Electron 这类需要自己准备运行时的，先在自己的 job 里构建并把 `.app` 打成 tar 上传，再用 `app-artifact` 交给 `macos-release.yml` 签名，见「自行构建，再交给复用工作流签名」。
+
+**没有 Apple 开发者证书能试吗？** 可以，传 `sign: false` 做试运行：ad-hoc 签名，不公证、不发布，只上传 Artifacts，不需要任何凭据。
+
+**为什么本仓库是公开的，会泄露凭据吗？** 个人账号下，被跨仓库调用的 reusable workflow 必须公开。仓库里只有构建逻辑，证书和密钥都存在调用方的 secrets 里。
+
+**公证失败或超时怎么办？** 公证失败时流程会自动取回 `notarytool log` 并打印原因；staple 和 validate 遇到网络断开会退避重试。常见原因是缺 `--options runtime` / `--timestamp`，或 Electron Helper 没给 `inner-entitlements`，见「实践中确定的做法」。
+
+**调用方一定要固定 `@v1` 吗？** 建议。`v1` 是随改动移动的 tag（见「版本」），固定它可以拿到修复又不会跨大版本。
+
+**和别的方案比？** 如果只需要在一个应用里签名公证，直接写一份 workflow 或用社区现成的 Action 也够了；这套的价值在于多个应用共用同一份流程，并带 Sparkle appcast 和 Homebrew cask 同步。
 
 ## 版本
 
